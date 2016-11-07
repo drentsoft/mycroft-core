@@ -39,7 +39,7 @@ from mycroft.util import str2bool
 from mycroft.util.audio_test import record
 from mycroft.util.log import getLogger
 
-__author__ = 'aatchison + jdorleans + iward'
+__author__ = 'aatchison + jdorleans + iward + penrods'
 
 LOGGER = getLogger("EnclosureClient")
 
@@ -202,15 +202,90 @@ class Enclosure:
     """
 
     def __init__(self):
-        self.__init_serial()
+        try:
+            self.config = ConfigurationManager.get().get("enclosure")
+
+            platform = self.config.get('platform')
+            if platform is None:
+                # Use the serial port to check if this is a Mycroft
+                # Mark 1 unit.
+                platform = self.detect_platform()
+                if platform == 'unknown':
+                    # Since this is a semi-permanent detection, be
+                    # certain!  Sometimes noise on the serial line
+                    # causes a faulty mis-detection on a real
+                    # Mycroft Mark 1
+                    platform = self.detect_platform()
+
+                ConfigurationManager.set('enclosure', 'platform',
+                                         platform)
+        except Exception as e:
+            self.disconnect()
+            raise Exception("Exception: Unable to determine platform\n" +
+                            str(e))
+
+        LOGGER.info("Platform = '" + platform + "'")
+        if platform == "mycroft_mark_1":
+            # We are a mycroft_mark_1 unit, start up the
+            # enclosure client to communicate over the
+            # serial port
+            self.__init_serial()
+        else:
+            self.disconnect()
+            raise Exception("Exception: Not a Mycroft Mark 1, shutting down")
+
         self.client = WebsocketClient()
         self.reader = EnclosureReader(self.serial, self.client)
         self.writer = EnclosureWriter(self.serial, self.client)
+
+        # Create helpers to handle the various parts of the enclosure
         self.eyes = EnclosureEyes(self.client, self.writer)
         self.mouth = EnclosureMouth(self.client, self.writer)
         self.system = EnclosureArduino(self.client, self.writer)
+
+        # TODO: Remove EnclosureWeather once the Skill can send images
+        #       directly to the EnclosureAPI.
         self.weather = EnclosureWeather(self.client, self.writer)
         self.__register_events()
+
+    def detect_platform(self):
+        LOGGER.info("Auto-detecting platform")
+        try:
+            self.__init_serial()
+            self.serial.flushInput()
+            self.serial.flushOutput()
+            time.sleep(1)
+            self.serial.flushInput()
+            self.serial.flushOutput()
+            time.sleep(1)
+
+            # Write "system.ping"
+            self.serial.write("system.ping")
+            time.sleep(1)
+
+            # Now check to see if we got a response from the ping command.
+            data = self.serial.readline()
+            LOGGER.info("Serial response: '" + data + "'")
+
+            # The Mycroft Arduino echos the output to the serial line
+            # prefixed by "Command: ".  This assumes only a Mycroft
+            # Arduino responds to this, which is probably a dubious
+            # assumption, but a decent enough auto-detect for now.
+            if "Command: system.ping" in data:
+                # We have a Mycroft Mark 1!
+
+                # The Arduino returns a version number in the response
+                # with recent builds.  Empty the serial queue of all
+                # responses to the ping.
+                time.sleep(0.5)
+                self.serial.flushInput()
+
+                return "mycroft_mark_1"
+        except:
+            pass
+
+        # Likely running on a generic Raspberry Pi or Linux desktop
+        return "unknown"
 
     def setup(self):
         must_upload = self.config.get('must_upload')
@@ -243,8 +318,11 @@ class Enclosure:
             os.chdir(old_path)
 
     def __init_serial(self):
+        if getattr(self, 'serial', None) is not None:
+            return  # already initialized
+
+        LOGGER.info("Opening serial port")
         try:
-            self.config = ConfigurationManager.get().get("enclosure")
             self.port = self.config.get("port")
             self.rate = int(self.config.get("rate"))
             self.timeout = int(self.config.get("timeout"))
@@ -299,10 +377,15 @@ class Enclosure:
             LOGGER.error("Client error: {0}".format(e))
             self.stop()
 
+    def disconnect(self):
+        if getattr(self, 'serial', None) is not None:
+            self.serial.close()
+            self.serial = None
+
     def stop(self):
         self.writer.stop()
         self.reader.stop()
-        self.serial.close()
+        self.disconnect()
 
 
 def main():
